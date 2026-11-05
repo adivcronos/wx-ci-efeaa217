@@ -1,0 +1,7 @@
+/target
+**/*.rs.bk
+# Cargo.lock IS committed (this is an application, not a library) for
+# reproducible builds.
+
+# Local build artifacts (installers staged for release) — never commit.
+/out/

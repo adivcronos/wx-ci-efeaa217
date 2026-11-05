@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Hardened-runtime entitlements for the OUTER Flutter app (Weather.app),
+     applied by build-v2.yml / build_release.sh when signing the bundle.
+
+     disable-library-validation lets the main executable load the bundled
+     FlutterMacOS.framework (and plugin frameworks) even when their signing
+     identity/team differs from the app's. Without it, macOS "library
+     validation" aborts the process at launch with a DYLD "Library missing …
+     different Team IDs" crash — which is exactly what an ad-hoc build hit,
+     because deep-signing does not reliably re-sign nested frameworks.
+     We now also sign every framework inside-out, but this entitlement is the
+     belt-and-suspenders guarantee (and is harmless on the Developer-ID path,
+     where the frameworks are signed with the same identity anyway). -->
+<plist version="1.0">
+<dict>
+	<key>com.apple.security.cs.disable-library-validation</key>
+	<true/>
+</dict>
+</plist>

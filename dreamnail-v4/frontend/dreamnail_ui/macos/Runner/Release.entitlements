@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- This app is a VPN client, NOT a sandboxable app. Connecting requires three
+     things the macOS App Sandbox forbids: (1) outbound sockets — the SSH tunnel
+     to the server (a sandbox blocks these unless network.client is granted);
+     (2) spawning the bundled Xray child process (a sandbox cannot exec a binary
+     that isn't launched as an XPC/login-item helper); (3) running `networksetup`
+     to set the system proxy. With the sandbox ON (the Flutter default that used
+     to be here) macOS connect failed at the tunnel/Xray stage while Linux — which
+     has no sandbox — worked, i.e. the classic "Linux is fine, macOS won't
+     connect". So the App Sandbox is intentionally OFF here.
+
+     disable-library-validation lets the hardened-runtime app (CI signs with
+     --options runtime) load the bundled engine dylib in Contents/Frameworks and
+     the differently-signed Flutter frameworks. This matches
+     scripts/macos_app.entitlements, which the CI applies when it seals the app,
+     so local `flutter build macos` and the CI build now behave identically. -->
+<plist version="1.0">
+<dict>
+	<key>com.apple.security.cs.disable-library-validation</key>
+	<true/>
+</dict>
+</plist>

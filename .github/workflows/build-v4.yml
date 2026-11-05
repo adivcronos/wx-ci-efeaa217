@@ -1,0 +1,406 @@
+name: Build Dreamnail v4
+
+# Builds the Dreamnail v4 client: the Flutter UI (Dart, AOT-native) with the
+# Rust engine (dreamnail-ffi) compiled to a cdylib and bundled INTO the app —
+# no Python backend, no localhost server, no runtime unpacking.
+#
+# Per OS the recipe is: build the Rust cdylib (release) FIRST so Flutter's CMake
+# can copy it into the bundle, drop the Xray binary next to the app exe (the
+# engine spawns current_exe()/xray), `flutter build`, package, and deploy.
+#
+# LINUX-FIRST: this workflow ships the Linux .deb today (fully verifiable on a
+# Fedora/Ubuntu dev box). Windows (.exe) and macOS (.dmg) legs are added next —
+# their CMake already bundles the cdylib; they need packaging + signing steps.
+# The deploy job publishes whatever built, so partial coverage still ships.
+#
+# Storage: build outputs attach to the rolling `v4-latest` prerelease as release
+# assets (NOT actions/upload-artifact, whose tiny quota kept filling up — see the
+# v2 workflow's note). `prepare` resets the release so `build` can upload into it.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'dreamnail-v4/**'
+      - '.github/workflows/build-v4.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-dreamnail-v4
+  cancel-in-progress: true
+
+env:
+  XRAY_VERSION: v26.6.1
+  FLUTTER_VERSION: '3.44.4'
+
+jobs:
+  prepare:
+    name: Reset v4-latest release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve app version
+        id: ver
+        run: |
+          set -euo pipefail
+          v=$(sed -n "s/.*appVersion[^']*'\([0-9][0-9A-Za-z.+-]*\)'.*/\1/p" \
+            dreamnail-v4/frontend/dreamnail_ui/lib/config.dart | head -1)
+          if [ -z "$v" ]; then
+            echo "Could not read appVersion from lib/config.dart"; exit 1
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "Resolved app version: $v"
+
+      - name: Reset the rolling 'v4-latest' release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          repo="$GITHUB_REPOSITORY"
+          gh release delete v4-latest --cleanup-tag --yes --repo "$repo" || true
+          sleep 5
+          gh release create v4-latest \
+            --repo "$repo" \
+            --target "$GITHUB_SHA" \
+            --title "Dreamnail v4 v${VERSION} (latest)" \
+            --prerelease \
+            --notes "Automated v4 build (v${VERSION}) from ${GITHUB_SHA}. Native Rust engine linked into the Flutter app; no Python backend."
+
+  build:
+    name: Build (${{ matrix.name }})
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-latest
+            xray_asset: Xray-linux-64.zip
+            xray_src: xray
+          - name: windows-x86_64
+            os: windows-latest
+            xray_asset: Xray-windows-64.zip
+            xray_src: xray.exe
+          - name: macos-arm64
+            os: macos-14
+            xray_asset: Xray-macos-arm64-v8a.zip
+            xray_src: xray
+    defaults:
+      run:
+        shell: bash
+    # Signing secrets surfaced as env so steps can gate on `env.X != ''` (the
+    # secrets context can't be used in a step `if:`). Absent → signing skips and
+    # the build ships unsigned (Windows: SmartScreen warning; macOS: needs a
+    # one-time `xattr -cr`, fine for the in-person-USB model).
+    env:
+      WINDOWS_CERT_PFX_BASE64: ${{ secrets.WINDOWS_CERT_PFX_BASE64 }}
+      WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+      MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+      MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+      MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+      MACOS_NOTARY_APPLE_ID: ${{ secrets.MACOS_NOTARY_APPLE_ID }}
+      MACOS_NOTARY_TEAM_ID: ${{ secrets.MACOS_NOTARY_TEAM_ID }}
+      MACOS_NOTARY_PASSWORD: ${{ secrets.MACOS_NOTARY_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Inject release secrets (replace public placeholders)
+        working-directory: dreamnail-v4
+        run: |
+          set -euo pipefail
+          sed -i.bak "s|__UUID_NAMESPACE__|${{ secrets.UUID_NAMESPACE }}|g" crates/dreamnail-plat/src/netcfg.rs
+          sed -i.bak "s|__LAUNCH_PASSWORD__|${{ secrets.LAUNCH_PASSWORD }}|g" frontend/dreamnail_ui/lib/config.dart
+          sed -i.bak "s|__REVEAL_KEYWORD__|${{ secrets.REVEAL_KEYWORD }}|g" frontend/dreamnail_ui/lib/config.dart
+          find . -name '*.bak' -delete
+          if grep -rn "__UUID_NAMESPACE__\|__LAUNCH_PASSWORD__\|__REVEAL_KEYWORD__" crates/dreamnail-plat/src/netcfg.rs frontend/dreamnail_ui/lib/config.dart; then
+            echo "::error::a release secret was not injected"; exit 1
+          fi
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+
+      - name: Install Linux desktop build deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          # GTK/ninja/clang for `flutter build linux`; appindicator -dev for
+          # tray_manager (CMake needs the .pc, not just the runtime .so).
+          # keybinder-3.0 is required by the hotkey_manager plugin's CMake
+          # (global panic hotkey); without -dev the Linux build fails to configure.
+          sudo apt-get install -y ninja-build cmake clang pkg-config \
+            libgtk-3-dev libayatana-appindicator3-dev libkeybinder-3.0-dev
+
+      # The cdylib MUST exist before `flutter build`: the app's CMake copies
+      # target/release/libdreamnail_ffi.{so,dll} into the bundle's lib dir.
+      # The tunhelper is the headless privileged binary stealth spawns elevated
+      # (see crates/dreamnail-tunhelper); it ships next to the app exe and every
+      # package step below copies it in.
+      - name: Build the Rust engine cdylib + tun helper (release)
+        working-directory: dreamnail-v4
+        run: cargo build --release -p dreamnail-ffi -p dreamnail-tunhelper --locked
+
+      - name: Download Xray for this platform
+        run: |
+          set -euo pipefail
+          url="https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/${{ matrix.xray_asset }}"
+          echo "Downloading $url"
+          curl -L --fail --retry 3 -o xray.zip "$url"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            powershell -Command "Expand-Archive -Path xray.zip -DestinationPath xray_tmp -Force"
+          else
+            unzip -o xray.zip -d xray_tmp
+          fi
+          # Stage under a stable name; each package step renames as needed.
+          mv "xray_tmp/${{ matrix.xray_src }}" "$RUNNER_TEMP/xray_bin"
+          chmod +x "$RUNNER_TEMP/xray_bin" || true
+
+      - name: Build the Flutter app (Linux)
+        if: runner.os == 'Linux'
+        working-directory: dreamnail-v4/frontend/dreamnail_ui
+        run: |
+          set -euo pipefail
+          flutter pub get
+          flutter build linux --release
+
+      # The engine spawns `xray` next to the app executable (current_exe()/xray),
+      # so drop it into the bundle root before packaging.
+      - name: Bundle Xray + package (.deb) (Linux)
+        if: runner.os == 'Linux'
+        working-directory: dreamnail-v4
+        run: |
+          set -euo pipefail
+          ver="${{ needs.prepare.outputs.version }}"
+          bundle="frontend/dreamnail_ui/build/linux/x64/release/bundle"
+          cp "$RUNNER_TEMP/xray_bin" "$bundle/xray"
+          chmod +x "$bundle/xray"
+          # Stealth helper — spawned elevated (pkexec) next to the app binary.
+          cp "target/release/dreamnail-tunhelper" "$bundle/dreamnail-tunhelper"
+          chmod +x "$bundle/dreamnail-tunhelper"
+          # Sanity: the engine lib + helper must be present.
+          test -f "$bundle/lib/libdreamnail_ffi.so" \
+            || { echo "missing lib/libdreamnail_ffi.so in bundle"; exit 1; }
+          test -x "$bundle/dreamnail-tunhelper" \
+            || { echo "missing dreamnail-tunhelper in bundle"; exit 1; }
+          out="$PWD/out"; mkdir -p "$out"
+          deb="$out/Dreamnail-${ver}-${{ matrix.name }}.deb"
+          bash scripts/make_linux_deb.sh "$bundle" "$ver" "$deb" \
+            frontend/dreamnail_ui/assets/icons/logo.png \
+            frontend/dreamnail_ui/assets/icons/logo.svg
+          echo "=== validate ==="; dpkg-deb --info "$deb"
+          dpkg-deb --contents "$deb" | sed -n '1,25p'
+          # Also build a portable AppImage (single file, no apt needed) from the
+          # same bundle. Full host access, so proxy + stealth work like the .deb.
+          appimg="$out/Dreamnail-${ver}-${{ matrix.name }}.AppImage"
+          bash scripts/make_linux_appimage.sh "$bundle" "$ver" "$appimg" \
+            frontend/dreamnail_ui/assets/icons/logo.png \
+            frontend/dreamnail_ui/assets/icons/logo.svg
+          test -s "$appimg" || { echo "AppImage not produced"; exit 1; }
+          ls -la "$out"
+
+      # ---- Windows -----------------------------------------------------------
+      - name: Build the Flutter app (Windows)
+        if: runner.os == 'Windows'
+        working-directory: dreamnail-v4/frontend/dreamnail_ui
+        run: |
+          set -euo pipefail
+          flutter pub get
+          flutter build windows --release
+
+      - name: Bundle Xray + package installer (Windows)
+        if: runner.os == 'Windows'
+        working-directory: dreamnail-v4
+        run: |
+          set -euo pipefail
+          ver="${{ needs.prepare.outputs.version }}"
+          rel="frontend/dreamnail_ui/build/windows/x64/runner/Release"
+          # Engine spawns current_exe()/xray.exe; DLL is bundled next to the exe.
+          cp "$RUNNER_TEMP/xray_bin" "$rel/xray.exe"
+          test -f "$rel/dreamnail_ffi.dll" \
+            || { echo "missing dreamnail_ffi.dll in $rel"; exit 1; }
+          # Stealth helper — spawned elevated (UAC) next to the app exe.
+          cp "target/release/dreamnail-tunhelper.exe" "$rel/dreamnail-tunhelper.exe"
+          test -f "$rel/dreamnail-tunhelper.exe" \
+            || { echo "missing dreamnail-tunhelper.exe in $rel"; exit 1; }
+          # Wintun (WireGuard-signed) — the TUN/stealth backend the engine loads
+          # by name at runtime. Drop it next to the exe; the Inno recursive copy
+          # installs it. Not needed for standard proxy mode, so its absence never
+          # breaks the app — but stealth on Windows requires it.
+          curl -L --fail --retry 3 -o wintun.zip "https://www.wintun.net/builds/wintun-0.14.1.zip"
+          powershell -Command "Expand-Archive -Path wintun.zip -DestinationPath wintun_tmp -Force"
+          cp "wintun_tmp/wintun/bin/amd64/wintun.dll" "$rel/wintun.dll"
+          test -f "$rel/wintun.dll" || { echo "missing wintun.dll in $rel"; exit 1; }
+          out="$PWD/out"; mkdir -p "$out"
+          base="Dreamnail-${ver}-${{ matrix.name }}"
+          choco install innosetup -y --no-progress >/dev/null
+          ISCC="/c/Program Files (x86)/Inno Setup 6/ISCC.exe"
+          [ -x "$ISCC" ] || ISCC="$(command -v iscc)"
+          # Git Bash rewrites args starting with '/' into Windows paths, mangling
+          # ISCC's /D defines ("more than one script filename"). Disable that.
+          export MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*'
+          "$ISCC" \
+            "/DMyVersion=$ver" \
+            "/DMyOutputBase=$base" \
+            "/DMyOutputDir=$(cygpath -w "$out")" \
+            "/DMySourceDir=$(cygpath -w "$PWD/$rel")" \
+            "/DMyIcon=$(cygpath -w "$PWD/frontend/dreamnail_ui/windows/runner/resources/app_icon.ico")" \
+            "$(cygpath -w "$PWD/scripts/win_installer.iss")"
+          ls -la "$out"
+
+      # ---- macOS -------------------------------------------------------------
+      - name: Build the Flutter app (macOS)
+        if: runner.os == 'macOS'
+        working-directory: dreamnail-v4/frontend/dreamnail_ui
+        run: |
+          set -euo pipefail
+          flutter pub get
+          flutter build macos --release
+
+      - name: Bundle engine + Xray, sign, package (.dmg) (macOS)
+        if: runner.os == 'macOS'
+        working-directory: dreamnail-v4
+        run: |
+          set -euo pipefail
+          ver="${{ needs.prepare.outputs.version }}"
+          out="$PWD/out"; mkdir -p "$out"
+          app="$(ls -d frontend/dreamnail_ui/build/macos/Build/Products/Release/*.app | head -1)"
+          echo "app: $app"
+          # The native engine dylib → Contents/Frameworks (engine.dart resolves it
+          # there); the xray binary → Contents/MacOS next to the exe (the engine
+          # spawns current_exe()/xray).
+          mkdir -p "$app/Contents/Frameworks" "$app/Contents/MacOS"
+          cp "target/release/libdreamnail_ffi.dylib" "$app/Contents/Frameworks/"
+          cp "$RUNNER_TEMP/xray_bin" "$app/Contents/MacOS/xray"
+          chmod +x "$app/Contents/MacOS/xray"
+          # Stealth helper — spawned elevated (osascript) next to the app binary
+          # in Contents/MacOS (current_exe().parent()). Signed below with xray.
+          cp "target/release/dreamnail-tunhelper" "$app/Contents/MacOS/dreamnail-tunhelper"
+          chmod +x "$app/Contents/MacOS/dreamnail-tunhelper"
+          ent_app="scripts/macos_app.entitlements"
+          if [ -n "${MACOS_SIGN_IDENTITY:-}" ] && [ -n "${MACOS_CERT_P12_BASE64:-}" ]; then
+            id="$MACOS_SIGN_IDENTITY"; ts="--timestamp"
+          else
+            echo "macOS signing secrets absent — ad-hoc (needs one-time xattr -cr)."
+            id="-"; ts="--timestamp=none"
+          fi
+          # Sign inside-out (deepest first), never --deep (which leaves nested
+          # frameworks with mismatched teams → DYLD 'different Team IDs' crash).
+          sign_deepest_first() {
+            local root="$1"; shift
+            find "$root" \( "$@" \) -print 2>/dev/null \
+              | awk '{print length, $0}' | sort -rn | cut -d" " -f2- \
+              | while IFS= read -r item; do
+                  codesign --force --options runtime $ts --sign "$id" "$item"
+                done
+          }
+          sign_deepest_first "$app/Contents/Frameworks" -name "*.framework" -o -name "*.dylib"
+          codesign --force --options runtime $ts --sign "$id" "$app/Contents/MacOS/xray"
+          codesign --force --options runtime $ts --sign "$id" "$app/Contents/MacOS/dreamnail-tunhelper"
+          # Seal the outer app LAST, library validation disabled so the main exe
+          # may load the (ad-hoc) frameworks + engine dylib it ships.
+          codesign --force --options runtime $ts \
+            --entitlements "$ent_app" --sign "$id" "$app"
+          codesign --verify --deep --strict --verbose=2 "$app" || true
+          # Drag-to-Applications DMG.
+          dmg="$out/Dreamnail-${ver}-${{ matrix.name }}.dmg"
+          stage="$(mktemp -d)/Weather"
+          mkdir -p "$stage"; cp -R "$app" "$stage/"
+          ln -s /Applications "$stage/Applications"
+          hdiutil create -volname "Weather" -srcfolder "$stage" -ov -format UDZO "$dmg"
+          ls -la "$out"
+
+      - name: Upload package to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        working-directory: dreamnail-v4
+        run: |
+          set -euo pipefail
+          # A leg can emit MORE than one artifact (Linux = .deb + .AppImage), so
+          # upload every package this matrix leg produced, not just the first.
+          shopt -s nullglob
+          files=(out/Dreamnail-${{ needs.prepare.outputs.version }}-${{ matrix.name }}.*)
+          [ ${#files[@]} -gt 0 ] || { echo "no packages to upload"; exit 1; }
+          for file in "${files[@]}"; do
+            echo "Uploading $file"
+            gh release upload v4-latest "$file" --clobber --repo "$GITHUB_REPOSITORY"
+          done
+
+  deploy:
+    name: Stage v4 on the download server
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    # Ship whatever built: a flaky leg (macOS is the shaky one) must not block the
+    # platforms that DID build. The manifest step includes only packages present.
+    if: always() && needs.prepare.result == 'success'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          # The release may hold only some platforms if a leg failed — that's fine.
+          gh release download v4-latest --dir release --repo "$GITHUB_REPOSITORY" --clobber || true
+          ls -la release || true
+          if ! ls release/Dreamnail-* >/dev/null 2>&1; then
+            echo "no packages built — nothing to deploy"; exit 0
+          fi
+
+      - name: Deploy to the server + publish manifest
+        env:
+          DEPLOY_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+        if: env.DEPLOY_KEY != ''
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          echo '66.226.144.136 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIG0qf9UMzuFxoPZnUaQDUs4Cshccs8dqsqNrjmP1SHf7' >> ~/.ssh/known_hosts
+          opts="-i $HOME/.ssh/deploy_key -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=20"
+          dest="deploy@66.226.144.136:/var/www/dreamnail/downloads/v4"
+          ssh $opts deploy@66.226.144.136 'mkdir -p /var/www/dreamnail/downloads/v4'
+          ver="${{ needs.prepare.outputs.version }}"
+          lin="Dreamnail-${ver}-linux-x86_64.deb"
+          appi="Dreamnail-${ver}-linux-x86_64.AppImage"
+          win="Dreamnail-${ver}-windows-x86_64.exe"
+          mac="Dreamnail-${ver}-macos-arm64.dmg"
+          for f in "$lin" "$appi" "$win" "$mac"; do
+            if [ -f "release/$f" ]; then
+              scp $opts "release/$f" "$dest/$f" && echo "staged $f"
+            else
+              echo "skip: release/$f not built yet"
+            fi
+          done
+          # Manifest: only include platforms that actually built (the updater
+          # treats a missing platform as "no update for this OS").
+          sha() { [ -f "release/$1" ] && sha256sum "release/$1" | cut -d' ' -f1 || echo ""; }
+          plats=""
+          [ -f "release/$lin" ] && plats="$plats\"linux\":{\"file\":\"$lin\",\"sha256\":\"$(sha "$lin")\"},"
+          [ -f "release/$appi" ] && plats="$plats\"linux_appimage\":{\"file\":\"$appi\",\"sha256\":\"$(sha "$appi")\"},"
+          [ -f "release/$win" ] && plats="$plats\"windows\":{\"file\":\"$win\",\"sha256\":\"$(sha "$win")\"},"
+          [ -f "release/$mac" ] && plats="$plats\"macos\":{\"file\":\"$mac\",\"sha256\":\"$(sha "$mac")\"},"
+          plats="${plats%,}"
+          printf '{"version":"%s","base_url":"https://66.226.144.136/downloads/v4/","platforms":{%s}}\n' \
+            "$ver" "$plats" > release/latest.json
+          echo "=== latest.json ==="; cat release/latest.json
+          scp $opts release/latest.json "$dest/latest.json" && echo "published latest.json"
+          rm -f ~/.ssh/deploy_key

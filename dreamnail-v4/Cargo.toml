@@ -1,0 +1,43 @@
+# Dreamnail v4 — Rust rewrite of the VPN engine (see V4_PLAN.md).
+#
+# The engine that was the Python backend becomes a native Rust library compiled
+# INTO the Flutter app (no separate process, no localhost server). This workspace
+# holds the pure engine (dreamnail-core), the per-OS adapters (dreamnail-plat),
+# and a headless test harness (dreamnail-cli). The FFI crate that Flutter links
+# against is added in Phase B.
+[workspace]
+resolver = "2"
+members = [
+    "crates/dreamnail-core",
+    "crates/dreamnail-plat",
+    "crates/dreamnail-cli",
+    "crates/dreamnail-ffi",
+    "crates/dreamnail-tunhelper",
+]
+# The vendored crate is a patch target, not a workspace member.
+exclude = ["vendor/tun2proxy", "vendor/tproxy-config"]
+
+# tun2proxy 0.8.3 with a fix to its UDP-gateway session loop (see
+# vendor/tun2proxy/DREAMNAIL_PATCH.md): the stock loop cancels a half-read
+# gateway frame under bidirectional load, desyncing the stream and dropping
+# game UDP sessions mid-play (Roblox kicks on the resulting source-port change).
+[patch.crates-io]
+tun2proxy = { path = "vendor/tun2proxy" }
+# tproxy-config 7.0.7 with Windows commands spawned windowless (see
+# vendor/tproxy-config/DREAMNAIL_PATCH.md).
+tproxy-config = { path = "vendor/tproxy-config" }
+
+[workspace.package]
+# Informational only — the app version customers see (and the USB updater compares)
+# is `AppConfig.appVersion` in frontend/dreamnail_ui/lib/config.dart, which CI reads
+# and dreamnail-plat's build.rs compiles into `netcfg::APP_VERSION`. Kept roughly in
+# step so `cargo` output isn't misleading.
+version = "4.4.0"
+edition = "2021"
+
+[profile.release]
+# Small, self-contained binary — the whole point of going native.
+opt-level = "z"
+lto = true
+strip = true
+panic = "abort"

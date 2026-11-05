@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Debug builds must also run UN-sandboxed, or a developer reproducing a connect
+     on macOS hits the same tunnel/Xray blocks the sandbox imposes (see
+     Release.entitlements). allow-jit is required for the Dart VM's JIT in debug;
+     with the sandbox off, all network (incl. the VM service) is already allowed,
+     so no network.* entitlement is needed. -->
+<plist version="1.0">
+<dict>
+	<key>com.apple.security.cs.allow-jit</key>
+	<true/>
+	<key>com.apple.security.cs.disable-library-validation</key>
+	<true/>
+</dict>
+</plist>

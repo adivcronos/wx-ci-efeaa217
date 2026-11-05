@@ -1,0 +1,10 @@
+[package]
+name = "dreamnail-core"
+version.workspace = true
+edition.workspace = true
+
+# Deliberately ZERO dependencies: the core is pure engine logic (state machine +
+# orchestration over traits). All I/O — SSH, Xray, OS proxy, network — lives
+# behind the traits in `ports` and is injected, so the core builds and tests
+# offline with no crates.io access and no network.
+[dependencies]

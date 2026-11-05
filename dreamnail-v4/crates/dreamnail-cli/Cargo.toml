@@ -1,0 +1,16 @@
+[package]
+name = "dreamnail-cli"
+version.workspace = true
+edition.workspace = true
+
+# Headless harness (the v4 answer to test_connect.py): drives the engine with the
+# real adapters and no UI, for CI smoke tests and hands-on debugging on each OS.
+[[bin]]
+name = "dreamnail-cli"
+path = "src/main.rs"
+
+[dependencies]
+dreamnail-core = { path = "../dreamnail-core" }
+dreamnail-plat = { path = "../dreamnail-plat" }
+# Clean Ctrl-C teardown so an interrupted hold still restores routing/proxy.
+ctrlc = "3"

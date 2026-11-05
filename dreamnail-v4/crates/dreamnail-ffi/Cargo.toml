@@ -1,0 +1,15 @@
+[package]
+name = "dreamnail-ffi"
+version.workspace = true
+edition.workspace = true
+
+# The boundary Flutter links against. Built as a cdylib (loaded via dart:ffi /
+# flutter_rust_bridge on desktop + Android) and a staticlib (iOS). rlib too so
+# other Rust (tests) can use it.
+[lib]
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+dreamnail-core = { path = "../dreamnail-core" }
+dreamnail-plat = { path = "../dreamnail-plat" }
+serde_json = "1.0.151"

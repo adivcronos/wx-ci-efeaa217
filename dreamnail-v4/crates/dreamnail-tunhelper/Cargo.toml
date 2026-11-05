@@ -1,0 +1,36 @@
+[package]
+name = "dreamnail-tunhelper"
+version.workspace = true
+edition.workspace = true
+
+# Headless, privileged TUN helper. The GUI spawns THIS (via pkexec / osascript /
+# UAC) so the elevated code has NO GUI — sidestepping the GTK-image-sandbox crash
+# as root on Linux, the root-window refusal on macOS, and the whole relaunch-as-
+# admin dance. It creates the TUN + routes and self-terminates on a stop-file or
+# when its parent (the GUI) goes away.
+[[bin]]
+name = "dreamnail-tunhelper"
+path = "src/main.rs"
+
+[dependencies]
+dreamnail-plat = { path = "../dreamnail-plat" }
+# Installs a logger so tun2proxy's own route/DNS setup trace (it logs via `log`)
+# actually reaches our redirected stderr → /tmp/dreamnail-tunhelper.log. Without a
+# logger those messages are silently dropped, which is why macOS failures were
+# invisible. Same version already in the tree (via tun2proxy).
+env_logger = "0.11"
+# The helper's own status/error lines go through `log` too (not just eprintln!),
+# so they land in the SAME sink as tun2proxy's trace. That matters on Windows,
+# where the elevated helper has no inherited stderr — env_logger is pointed at a
+# file there (see main.rs), and log:: is the only way the helper's messages reach
+# it. Already in the tree via tun2proxy/env_logger.
+log = "0.4"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# OpenProcess/WaitForSingleObject so the helper can tell if its parent GUI is
+# still alive and self-terminate if it died (else a GUI crash orphans the
+# elevated TUN helper — stale adapter + routes). Same crate/version as plat.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_Registry", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
